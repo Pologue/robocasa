@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import imageio
+import mujoco
 import numpy as np
 import pandas as pd
 import robosuite
@@ -109,6 +110,12 @@ def parse_args():
         type=int,
         default=10,
         help="Maximum number of episodes to write debug videos for.",
+    )
+    parser.add_argument(
+        "--min_visible_pixels",
+        type=int,
+        default=24,
+        help="Minimum visible segmentation pixels required before emitting an affordance annotation.",
     )
     parser.add_argument(
         "--verbose",
@@ -287,6 +294,152 @@ def get_fixture_center(fixture):
     return None
 
 
+def _get_gripper(env):
+    return env.robots[0].gripper["right"]
+
+
+def _body_geom_ids(model, body_id):
+    root_body_id = int(model.body_rootid[body_id])
+    geom_ids = []
+    for sub_body_id in range(model.nbody):
+        if int(model.body_rootid[sub_body_id]) != root_body_id:
+            continue
+        geom_start = int(model.body_geomadr[sub_body_id])
+        geom_count = int(model.body_geomnum[sub_body_id])
+        if geom_count <= 0:
+            continue
+        geom_ids.extend(range(geom_start, geom_start + geom_count))
+    return geom_ids
+
+
+def get_target_geom_ids(env, target_name, target_type, geom_cache):
+    cache_key = (target_type, target_name)
+    if cache_key in geom_cache:
+        return geom_cache[cache_key]
+
+    body_id = None
+    if target_type == "object" and target_name in env.obj_body_id:
+        body_id = int(env.obj_body_id[target_name])
+    elif target_name in env.objects:
+        body_id = int(env.obj_body_id[target_name])
+    elif target_name in env.fixtures:
+        fixture = env.fixtures[target_name]
+        root_body = getattr(fixture, "root_body", None)
+        if isinstance(root_body, str):
+            try:
+                body_id = int(env.sim.model.body_name2id(root_body))
+            except Exception:
+                body_id = None
+
+    geom_ids = [] if body_id is None else _body_geom_ids(env.sim.model, body_id)
+    geom_cache[cache_key] = geom_ids
+    return geom_ids
+
+
+def mask_to_bbox(mask):
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+
+def mask_boundary(mask):
+    if mask is None or not np.any(mask):
+        return None
+
+    up = np.pad(mask[:-1, :], ((1, 0), (0, 0)), constant_values=False)
+    down = np.pad(mask[1:, :], ((0, 1), (0, 0)), constant_values=False)
+    left = np.pad(mask[:, :-1], ((0, 0), (1, 0)), constant_values=False)
+    right = np.pad(mask[:, 1:], ((0, 0), (0, 1)), constant_values=False)
+    interior = mask & up & down & left & right
+    return mask & (~interior)
+
+
+def render_visible_affordance(
+    env,
+    target_name,
+    target_type,
+    camera_name,
+    image_h,
+    image_w,
+    geom_cache,
+    min_visible_pixels,
+):
+    geom_ids = get_target_geom_ids(env, target_name, target_type, geom_cache)
+    if len(geom_ids) == 0:
+        return {
+            "visible": False,
+            "visible_pixel_count": 0,
+            "bbox": None,
+            "mask": None,
+        }
+
+    seg = env.sim.render(
+        height=image_h,
+        width=image_w,
+        camera_name=camera_name,
+        segmentation=True,
+    )[::-1]
+
+    obj_types = seg[:, :, 0]
+    obj_ids = seg[:, :, 1]
+    geom_type = int(mujoco.mjtObj.mjOBJ_GEOM)
+    mask = (obj_types == geom_type) & np.isin(obj_ids, np.asarray(geom_ids, dtype=np.int32))
+
+    visible_pixel_count = int(mask.sum())
+    if visible_pixel_count < int(min_visible_pixels):
+        return {
+            "visible": False,
+            "visible_pixel_count": visible_pixel_count,
+            "bbox": None,
+            "mask": None,
+        }
+
+    return {
+        "visible": True,
+        "visible_pixel_count": visible_pixel_count,
+        "bbox": mask_to_bbox(mask),
+        "mask": mask,
+    }
+
+
+def overlay_affordance_mask(
+    img,
+    mask,
+    bbox=None,
+    fill_color=(64, 220, 96),
+    edge_color=(24, 120, 36),
+    alpha=0.28,
+):
+    if mask is None or not np.any(mask):
+        return img
+
+    out = img.copy()
+    fill = np.array(fill_color, dtype=np.float32)
+    out_mask = out[mask].astype(np.float32)
+    out[mask] = np.clip((1.0 - alpha) * out_mask + alpha * fill, 0, 255).astype(np.uint8)
+
+    boundary = mask_boundary(mask)
+    if boundary is not None and np.any(boundary):
+        out[boundary] = np.array(edge_color, dtype=np.uint8)
+
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        out[y0 : y0 + 2, x0 : x1 + 1] = edge_color
+        out[max(0, y1 - 1) : y1 + 1, x0 : x1 + 1] = edge_color
+        out[y0 : y1 + 1, x0 : x0 + 2] = edge_color
+        out[y0 : y1 + 1, max(0, x1 - 1) : x1 + 1] = edge_color
+
+    return out
+
+
+def safe_check_contact(env, lhs, rhs):
+    try:
+        return bool(env.check_contact(lhs, rhs))
+    except Exception:
+        return False
+
+
 def choose_target_focus(env, prev_focus_name=None):
     """
     Choose current affordance target by interaction focus:
@@ -294,6 +447,24 @@ def choose_target_focus(env, prev_focus_name=None):
     - Fall back to nearby fixture when object is not close.
     """
     g = get_gripper_pos(env)
+    gripper = _get_gripper(env)
+
+    contacted_object = None
+    for obj_name, obj in env.objects.items():
+        if safe_check_contact(env, gripper, obj):
+            contacted_object = obj_name
+            break
+    if contacted_object is not None:
+        body_id = env.obj_body_id[contacted_object]
+        return contacted_object, np.array(env.sim.data.body_xpos[body_id]), "object"
+
+    contacted_fixture = None
+    for fx_name, fixture in env.fixtures.items():
+        if safe_check_contact(env, gripper, fixture):
+            contacted_fixture = fx_name
+            break
+    if contacted_fixture is not None:
+        return contacted_fixture, get_fixture_center(env.fixtures[contacted_fixture]), "fixture"
 
     best_obj_name = None
     best_obj_xyz = None
@@ -484,6 +655,9 @@ def write_dense_episode(dense_dir, dense_format, ep_idx, dense_payload):
                     "target_type": dense_payload["target_type"][i],
                     "target_xyz": dense_payload["target_xyz"][i],
                     "target_uv": dense_payload["target_uv"][i],
+                    "target_visible": bool(dense_payload["target_visible"][i]),
+                    "target_visible_pixel_count": int(dense_payload["target_visible_pixel_count"][i]),
+                    "target_bbox": dense_payload["target_bbox"][i],
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         return str(path)
@@ -505,6 +679,17 @@ def write_dense_episode(dense_dir, dense_format, ep_idx, dense_payload):
             target_type=np.array(dense_payload["target_type"], dtype=object),
             target_xyz=xyz,
             target_uv=uv,
+            target_visible=np.array(dense_payload["target_visible"], dtype=bool),
+            target_visible_pixel_count=np.array(
+                dense_payload["target_visible_pixel_count"], dtype=np.int32
+            ),
+            target_bbox=np.array(
+                [
+                    [np.nan, np.nan, np.nan, np.nan] if x is None else x
+                    for x in dense_payload["target_bbox"]
+                ],
+                dtype=np.float32,
+            ),
         )
         return str(path)
 
@@ -516,6 +701,9 @@ def write_dense_episode(dense_dir, dense_format, ep_idx, dense_payload):
             "target_type": dense_payload["target_type"],
             "target_xyz": dense_payload["target_xyz"],
             "target_uv": dense_payload["target_uv"],
+            "target_visible": dense_payload["target_visible"],
+            "target_visible_pixel_count": dense_payload["target_visible_pixel_count"],
+            "target_bbox": dense_payload["target_bbox"],
         }
     )
     df.to_parquet(path, index=False)
@@ -551,6 +739,7 @@ def episode_record(
     expected_subtasks,
     write_debug_video,
     debug_video_dir,
+    min_visible_pixels,
 ):
     states = LU.get_episode_states(dataset_root, ep_idx)
     ep_meta = LU.get_episode_meta(dataset_root, ep_idx)
@@ -569,6 +758,9 @@ def episode_record(
     focus_types = []
     target_xyz = []
     target_uv = []
+    target_visible = []
+    target_visible_pixel_count = []
+    target_bbox = []
 
     video_writer = None
     if write_debug_video:
@@ -577,6 +769,7 @@ def episode_record(
         video_writer = imageio.get_writer(str(video_path), fps=20)
 
     prev_focus_name = None
+    geom_cache = {}
 
     for t in range(states.shape[0]):
         reset_to(env, {"states": states[t]})
@@ -594,12 +787,26 @@ def episode_record(
                 image_w=image_w,
             )
 
+        visible_affordance = render_visible_affordance(
+            env,
+            target_name=focus_name,
+            target_type=focus_type,
+            camera_name=camera_name,
+            image_h=image_h,
+            image_w=image_w,
+            geom_cache=geom_cache,
+            min_visible_pixels=min_visible_pixels,
+        )
+
         xyz_out = None if xyz is None else [float(v) for v in xyz]
 
         focus_names.append(focus_name)
         focus_types.append(focus_type)
         target_xyz.append(xyz_out)
         target_uv.append(uv)
+        target_visible.append(bool(visible_affordance["visible"]))
+        target_visible_pixel_count.append(int(visible_affordance["visible_pixel_count"]))
+        target_bbox.append(visible_affordance["bbox"])
 
         if video_writer is not None:
             frame = env.sim.render(
@@ -607,7 +814,12 @@ def episode_record(
                 width=image_w,
                 camera_name=camera_name,
             )[::-1]
-            frame = draw_cross(frame, uv)
+            if visible_affordance["visible"]:
+                frame = overlay_affordance_mask(
+                    frame,
+                    visible_affordance["mask"],
+                    bbox=visible_affordance["bbox"],
+                )
             video_writer.append_data(frame)
 
     if video_writer is not None:
@@ -642,6 +854,9 @@ def episode_record(
             "target_type": focus_types,
             "target_xyz": target_xyz,
             "target_uv": target_uv,
+            "target_visible": target_visible,
+            "target_visible_pixel_count": target_visible_pixel_count,
+            "target_bbox": target_bbox,
         }
         dense_path = write_dense_episode(dense_dir, dense_format, ep_idx, dense_payload)
 
@@ -655,6 +870,11 @@ def episode_record(
         "subtask_boundaries": boundaries,
         "num_segments": len(boundaries),
         "expected_num_subtasks": expected_subtasks,
+        "affordance_schema": {
+            "target_uv": "3D target center projected to the camera plane; may be outside the visible object silhouette.",
+            "target_bbox": "Visible affordance bbox in xyxy pixel coordinates, omitted when fully occluded.",
+            "target_visible": "True only when the target occupies at least --min_visible_pixels segmentation pixels.",
+        },
         "dense_path": dense_path,
     }
 
@@ -715,6 +935,7 @@ def main():
                 expected_subtasks=expected_subtasks,
                 write_debug_video=write_debug_video,
                 debug_video_dir=debug_video_dir,
+                min_visible_pixels=args.min_visible_pixels,
             )
             record["task"] = task_name
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
