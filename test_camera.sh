@@ -8,14 +8,14 @@ cameras=(
     "robot0_agentview_left"
     "robot0_agentview_right"
     "robot0_frontview"
-    "robot0_robotview"
+    # "robot0_robotview"
     "robot0_eye_in_hand"
 )
 
-# dataset=datasets/v1.0/pretrain/composite/PrepareCoffee/20250716/lerobot
+dataset=datasets/v1.0/pretrain/composite/PrepareCoffee/20250716/lerobot
 # dataset=datasets/v1.0/pretrain/composite/PackIdenticalLunches/20250805/lerobot
 # dataset=datasets/v1.0/pretrain/composite/DeliverStraw/20250723/lerobot
-dataset=datasets/v1.0/pretrain/atomic/PickPlaceCounterToCabinet/20250819/lerobot
+# dataset=datasets/v1.0/pretrain/atomic/PickPlaceCounterToCabinet/20250819/lerobot
 
 task_dir=$(dirname "$(dirname "$dataset")")
 task_name=$(basename "$task_dir")

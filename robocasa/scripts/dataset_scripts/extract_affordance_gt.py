@@ -374,12 +374,20 @@ def render_visible_affordance(
             "mask": None,
         }
 
+    orig_rgba = env.sim.model.geom_rgba.copy()
+    for i in range(env.sim.model.ngeom):
+        name = env.sim.model.geom_id2name(i)
+        if name and "robot" in name:
+            env.sim.model.geom_rgba[i, 3] = 0.0
+
     seg = env.sim.render(
         height=image_h,
         width=image_w,
         camera_name=camera_name,
         segmentation=True,
     )[::-1]
+
+    env.sim.model.geom_rgba[:] = orig_rgba
 
     obj_types = seg[:, :, 0]
     obj_ids = seg[:, :, 1]
