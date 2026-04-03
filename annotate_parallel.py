@@ -8,6 +8,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
@@ -71,6 +72,7 @@ def run_annotation_for_camera(
     min_visible_pixels: int = 24,
     enforce_expected_subtasks: bool = True,
     debug_video: bool = True,
+    retries: int = 1,
     verbose: bool = False,
 ) -> Tuple[str, str, bool, str]:
     """
@@ -133,20 +135,45 @@ def run_annotation_for_camera(
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         
-        # Run extraction
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=3600,
+        logs_dir = output_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / "extract.log"
+
+        max_attempts = max(1, int(retries) + 1)
+        for attempt in range(1, max_attempts + 1):
+            result = subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+
+            log_text = (
+                f"[attempt {attempt}/{max_attempts}] returncode={result.returncode}\n"
+                f"cmd: {' '.join(cmd)}\n"
+                f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}\n"
+                "----- STDOUT -----\n"
+                f"{result.stdout}\n"
+                "----- STDERR -----\n"
+                f"{result.stderr}\n"
+                "====================\n"
+            )
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(log_text)
+
+            if result.returncode == 0:
+                return task_name, camera_name, True, f"Saved to {summary_path}"
+
+            if attempt < max_attempts:
+                time.sleep(2.0)
+
+        return (
+            task_name,
+            camera_name,
+            False,
+            f"Command failed after {max_attempts} attempts. Log: {log_path}",
         )
-        
-        if result.returncode != 0:
-            error_msg = result.stderr or result.stdout
-            return task_name, camera_name, False, f"Command failed: {error_msg[:200]}"
-        
-        return task_name, camera_name, True, f"Saved to {summary_path}"
     
     except subprocess.TimeoutExpired:
         return task_name, camera_name, False, "Timeout (>1 hour)"
@@ -187,6 +214,12 @@ def main():
         type=int,
         default=1,
         help="Number of GPUs available (GPUs will be cycled).",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Retry times per failed work item.",
     )
     parser.add_argument(
         "--cameras",
@@ -236,6 +269,15 @@ def main():
     )
     
     args = parser.parse_args()
+
+    if args.num_gpus < 1:
+        raise ValueError("--num_gpus must be >= 1")
+    if args.max_workers < 1:
+        raise ValueError("--max_workers must be >= 1")
+    if args.retries < 0:
+        raise ValueError("--retries must be >= 0")
+
+    gpu_ids = list(range(args.num_gpus))
     
     # Discover tasks
     composite_root = Path(args.composite_root)
@@ -259,7 +301,7 @@ def main():
                 "dataset_path": str(dataset_path),
                 "task_name": task_name,
                 "camera_name": camera,
-                "gpu_id": gpu_id_cycle % args.num_gpus,
+                "gpu_id": gpu_ids[gpu_id_cycle % len(gpu_ids)],
                 "num_episodes": args.num_episodes,
                 "segment_min_frames": args.segment_min_frames,
                 "target_switch_min_frames": args.target_switch_min_frames,
@@ -267,15 +309,18 @@ def main():
                 "min_visible_pixels": args.min_visible_pixels,
                 "enforce_expected_subtasks": not args.no_expected_subtasks,
                 "debug_video": not args.no_debug_video,
+                "retries": args.retries,
                 "verbose": args.verbose,
             })
             gpu_id_cycle += 1
     
     print(f"Total work items: {len(work_items)} (tasks × cameras)")
+
+    effective_workers = args.max_workers
     
     # Process with thread pool
     results = []
-    with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
         futures = {
             executor.submit(run_annotation_for_camera, **item): item["task_name"]
             for item in work_items
