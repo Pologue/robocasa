@@ -133,7 +133,7 @@ def run_annotation_for_camera(
         
         # Set GPU environment
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["MUJOCO_EGL_DEVICES_ID"] = str(gpu_id)
         
         logs_dir = output_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +152,7 @@ def run_annotation_for_camera(
             log_text = (
                 f"[attempt {attempt}/{max_attempts}] returncode={result.returncode}\n"
                 f"cmd: {' '.join(cmd)}\n"
-                f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}\n"
+                f"MUJOCO_EGL_DEVICES_ID={env.get('MUJOCO_EGL_DEVICES_ID')}\n"
                 "----- STDOUT -----\n"
                 f"{result.stdout}\n"
                 "----- STDERR -----\n"
