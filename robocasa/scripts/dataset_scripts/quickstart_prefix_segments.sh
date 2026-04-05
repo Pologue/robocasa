@@ -50,7 +50,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Activate conda environment
 echo "Activating conda environment..."
-source /home/pologue/miniconda3/etc/profile.d/conda.sh
+source /opt/data/private/miniforge3/etc/profile.d/conda.sh
 conda activate robocasa
 
 cd "$PROJECT_ROOT"
