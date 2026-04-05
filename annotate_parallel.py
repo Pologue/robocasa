@@ -122,7 +122,8 @@ def run_annotation_for_camera(
         if debug_video:
             cmd.extend([
                 "--debug_video_dir", str(debug_video_dir),
-                "--debug_video_max_episodes", str(num_episodes),
+                # "--debug_video_max_episodes", str(num_episodes),
+                "--debug_video_max_episodes", "1",
             ])
         
         if enforce_expected_subtasks:
