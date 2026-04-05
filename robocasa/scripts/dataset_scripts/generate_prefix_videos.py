@@ -12,14 +12,12 @@ Usage:
 import argparse
 import json
 import logging
-import multiprocessing as mp
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import imageio
-import numpy as np
 
 try:
     import robocasa.utils.lerobot_utils as LU
@@ -45,7 +43,10 @@ def parse_args():
         "--dataset",
         type=str,
         required=True,
-        help="Path to LeRobot dataset root.",
+        help=(
+            "Path to composite dataset root (e.g. datasets/v1.0/pretrain/composite). "
+            "The script auto-discovers per-task lerobot datasets under this root."
+        ),
     )
     parser.add_argument(
         "--outputs-dir",
@@ -92,7 +93,12 @@ def parse_args():
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip episodes that already have video files.",
+        help="Deprecated: existing videos are skipped by default. Kept for backward compatibility.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing segment videos instead of skipping.",
     )
     parser.add_argument(
         "--fps",
@@ -116,6 +122,61 @@ def load_json(path: Path) -> Optional[Dict]:
     except Exception as e:
         logger.warning(f"Failed to load {path}: {e}")
         return None
+
+
+def discover_lerobot_datasets(composite_root: Path, task_filter: Optional[str] = None) -> Dict[str, Path]:
+    """Discover task_name -> lerobot dataset path from a composite dataset root.
+
+    Expected layout:
+        composite_root/<task_name>/<date_or_variant>/lerobot
+
+    If multiple lerobot paths exist for a task, the lexicographically last one is used.
+    """
+    task_to_paths: Dict[str, List[Path]] = {}
+
+    # Backward-compatible single-dataset mode.
+    if (composite_root / "meta").exists() and (composite_root / "data").exists():
+        inferred_task = (
+            composite_root.parent.parent.name
+            if composite_root.name == "lerobot" and composite_root.parent.parent.exists()
+            else composite_root.parent.name
+        )
+        if task_filter is None or inferred_task == task_filter:
+            return {inferred_task: composite_root}
+        return {}
+
+    for task_folder in sorted(composite_root.iterdir()):
+        if not task_folder.is_dir():
+            continue
+
+        task_name = task_folder.name
+        if task_filter is not None and task_name != task_filter:
+            continue
+
+        candidates = []
+        for sub in sorted(task_folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            lerobot_path = sub / "lerobot"
+            if lerobot_path.exists() and lerobot_path.is_dir():
+                candidates.append(lerobot_path)
+
+        if candidates:
+            task_to_paths[task_name] = candidates
+
+    resolved: Dict[str, Path] = {}
+    for task_name, paths in task_to_paths.items():
+        resolved[task_name] = sorted(paths)[-1]
+
+    return resolved
+
+
+def get_segment_dirs(task_dir: Path, num_segments: int) -> List[Path]:
+    """Get segment directories, preferring prefix_videos and keeping legacy compatibility."""
+    prefix_root = task_dir / "prefix_videos"
+    if prefix_root.exists():
+        return sorted(prefix_root.glob(f"episode_*_prefix_{num_segments}seg"))
+    return sorted(task_dir.glob(f"episode_*_prefix_{num_segments}seg"))
 
 
 def generate_prefix_video(
@@ -173,14 +234,13 @@ def process_segment(args_tuple: Tuple) -> Dict:
         task_name,
         ep_idx,
         segment_info,
-        task_dir,
+        segment_dir,
         camera_name,
         image_h,
         image_w,
         fps,
-        dataset_root,
-        num_segments,
-        skip_existing,
+        task_dataset_root,
+        overwrite,
     ) = args_tuple
 
     result = {
@@ -198,22 +258,21 @@ def process_segment(args_tuple: Tuple) -> Dict:
         end_frame = segment_info["end_frame"]
 
         # Output directory and video path
-        segment_dir = task_dir / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
         video_dir = segment_dir / "videos"
         video_path = video_dir / f"segment_{seg_idx:02d}.mp4"
 
-        # Check if already exists
-        if skip_existing and video_path.exists():
+        # Existing outputs are skipped by default.
+        if (not overwrite) and video_path.exists():
             result["error"] = "Already exists (skipped)"
             return result
 
         # Build environment
-        env = build_env(dataset_root, need_offscreen=True)
+        env = build_env(task_dataset_root, need_offscreen=True)
 
         # Generate video
         success = generate_prefix_video(
             env,
-            dataset_root,
+            task_dataset_root,
             ep_idx,
             start_frame,
             end_frame,
@@ -232,7 +291,7 @@ def process_segment(args_tuple: Tuple) -> Dict:
         else:
             result["error"] = "Video generation failed"
 
-    except Exception as e:
+    except Exception:
         result["error"] = f"Exception: {traceback.format_exc()}"
 
     return result
@@ -247,7 +306,7 @@ def main():
 
     dataset_root = Path(args.dataset)
     if not dataset_root.exists():
-        logger.error(f"Dataset not found: {dataset_root}")
+        logger.error(f"Dataset root not found: {dataset_root}")
         return
 
     outputs_dir = Path(args.outputs_dir)
@@ -261,13 +320,31 @@ def main():
     else:
         task_dirs = sorted([d for d in outputs_dir.iterdir() if d.is_dir()])
 
+    # Discover lerobot dataset path per task.
+    task_to_dataset = discover_lerobot_datasets(dataset_root, task_filter=args.task)
+    if len(task_to_dataset) == 0:
+        logger.error(
+            "No lerobot datasets discovered from --dataset. "
+            "Expected layout: <composite_root>/<task>/<date>/lerobot"
+        )
+        return
+
     # Collect work items
     work_items = []
     for task_dir in task_dirs:
         task_name = task_dir.name
+        task_dataset_root = task_to_dataset.get(task_name)
+        if task_dataset_root is None:
+            logger.warning(f"No dataset found for task {task_name}; skipped")
+            continue
 
-        # Find episode directories with segment metadata
-        for ep_dir in sorted(task_dir.glob(f"episode_*_prefix_{args.num_segments}seg")):
+        # Find episode directories with segment metadata (new path first, then legacy).
+        segment_dirs = get_segment_dirs(task_dir, args.num_segments)
+        if len(segment_dirs) == 0:
+            # Auto-skip unannotated/unsegmented tasks.
+            continue
+
+        for ep_dir in segment_dirs:
             metadata_path = ep_dir / "segments_metadata.json"
             if not metadata_path.exists():
                 continue
@@ -286,14 +363,13 @@ def main():
                         task_name,
                         ep_idx,
                         segment,
-                        task_dir,
+                        ep_dir,
                         args.camera_name,
                         args.camera_height,
                         args.camera_width,
                         args.fps,
-                        dataset_root,
-                        args.num_segments,
-                        args.skip_existing,
+                        task_dataset_root,
+                        args.overwrite,
                     )
                 )
 

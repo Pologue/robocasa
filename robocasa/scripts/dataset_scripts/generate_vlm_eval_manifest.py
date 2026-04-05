@@ -50,6 +50,14 @@ def load_jsonl(path: Path) -> List[Dict]:
     return rows
 
 
+def get_segment_dirs(task_dir: Path, num_segments: int) -> List[Path]:
+    """Get segment directories, preferring prefix_videos and keeping legacy compatibility."""
+    prefix_root = task_dir / "prefix_videos"
+    if prefix_root.exists():
+        return sorted(prefix_root.glob(f"episode_*_prefix_{num_segments}seg"))
+    return sorted(task_dir.glob(f"episode_*_prefix_{num_segments}seg"))
+
+
 def generate_vlm_eval_manifest(
     outputs_dir: Path,
     num_segments: int,
@@ -75,7 +83,7 @@ def generate_vlm_eval_manifest(
         task_name = task_dir.name
 
         # Find segment directories
-        for segment_dir in sorted(task_dir.glob(f"episode_*_prefix_{num_segments}seg")):
+        for segment_dir in get_segment_dirs(task_dir, num_segments):
             metadata_path = segment_dir / "segments_metadata.json"
             if not metadata_path.exists():
                 continue
@@ -150,13 +158,12 @@ def generate_stats_summary(
     task_dirs = sorted([d for d in outputs_dir.iterdir() if d.is_dir()])
 
     for task_dir in task_dirs:
-        task_name = task_dir.name
         task_episodes = 0
         task_segments = 0
         task_segments_with_videos = 0
 
         # Find segment directories
-        for segment_dir in sorted(task_dir.glob(f"episode_*_prefix_{num_segments}seg")):
+        for segment_dir in get_segment_dirs(task_dir, num_segments):
             metadata_path = segment_dir / "segments_metadata.json"
             if not metadata_path.exists():
                 continue
@@ -269,7 +276,7 @@ def main():
             logger.error(f"Outputs directory not found: {outputs_dir}")
             return
 
-        logger.info(f"Generating VLM evaluation manifest...")
+        logger.info("Generating VLM evaluation manifest...")
         manifest = generate_vlm_eval_manifest(
             outputs_dir,
             args.num_segments,
@@ -285,7 +292,7 @@ def main():
             logger.error(f"Outputs directory not found: {outputs_dir}")
             return
 
-        logger.info(f"Computing dataset statistics...")
+        logger.info("Computing dataset statistics...")
         stats = generate_stats_summary(
             outputs_dir,
             args.num_segments,
@@ -305,7 +312,7 @@ def main():
         invisible = stats["target_visibility_distribution"].get("invisible", 0)
         total_vis = visible + invisible
         if total_vis > 0:
-            logger.info(f"\nTarget Visibility:")
+            logger.info("\nTarget Visibility:")
             logger.info(f"  Visible:                    {visible} ({100.0*visible/total_vis:.1f}%)")
             logger.info(f"  Invisible:                  {invisible} ({100.0*invisible/total_vis:.1f}%)")
         logger.info("=" * 60)

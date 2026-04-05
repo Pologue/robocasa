@@ -12,17 +12,12 @@ Usage:
 import argparse
 import json
 import logging
-import multiprocessing as mp
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-
-import robocasa.utils.lerobot_utils as LU
-from robocasa.scripts.dataset_scripts.extract_affordance_gt import build_env
-from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 
 # Setup logging
 logging.basicConfig(
@@ -314,8 +309,9 @@ def generate_prefix_segments_for_episode(
 
         # Check if already segmented
         if skip_existing:
-            segment_dir = task_dir / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
-            if segment_dir.exists():
+            new_segment_dir = task_dir / "prefix_videos" / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
+            legacy_segment_dir = task_dir / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
+            if new_segment_dir.exists() or legacy_segment_dir.exists():
                 result["error"] = "Already segmented (skipped)"
                 return result
 
@@ -378,7 +374,7 @@ def generate_prefix_segments_for_episode(
         result["original_task"] = ep_summary.get("task", ""),
         result["instruction"] = ep_summary.get("instruction", ""),
 
-    except Exception as e:
+    except Exception:
         result["error"] = f"Exception: {traceback.format_exc()}"
 
     return result
@@ -386,7 +382,7 @@ def generate_prefix_segments_for_episode(
 
 def save_segment_metadata(task_dir: Path, ep_idx: int, num_segments: int, segments: List[Dict]):
     """Save segment metadata to a JSON file."""
-    output_dir = task_dir / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
+    output_dir = task_dir / "prefix_videos" / f"episode_{ep_idx:06d}_prefix_{num_segments}seg"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_path = output_dir / "segments_metadata.json"
@@ -457,11 +453,6 @@ def main():
         task_dirs = [outputs_dir / args.task]
     else:
         task_dirs = sorted([d for d in outputs_dir.iterdir() if d.is_dir()])
-
-    total_episodes = 0
-    successful_episodes = 0
-    failed_episodes = 0
-    skipped_episodes = 0
 
     # Collect work items
     work_items = []
